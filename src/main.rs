@@ -2,6 +2,7 @@ pub mod colag;
 
 extern crate rand;
 
+use std::time::{SystemTime, Duration};
 use std::mem;
 use std::fmt;
 use std::collections::{HashSet};
@@ -35,7 +36,7 @@ impl fmt::Display for Hypothesis {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             &Hypothesis::RewardOnlyRelevantVL(weights) | &Hypothesis::RewardOnlyVL(weights) => {
-                write!(f, "VL( ")?;
+                write!(f, "VL( [{}] ", random_weighted_grammar(&weights))?;
                 for w in weights.iter(){
                     write!(f, "{:.2} ", w)?;
                 }
@@ -83,10 +84,40 @@ impl Hypothesis {
                 }
                 true
             }
-            _ => false
+            Hypothesis::Genetic(ref set) => {
+                set.len() == 1
+            }
+            Hypothesis::Trigger(_) => false
         }
     }
 
+    fn update(&mut self, domain: &Domain, sentence: &Sentence) {
+        match self {
+            &mut Hypothesis::RewardOnlyVL(ref mut weights) => {
+                loop {
+                    let ref grammar = random_weighted_grammar(&weights);
+                    // only returns ok if grammar exists in colag
+                    if let Ok(parses) = sentence_parses(domain, grammar, sentence) {
+                        if parses {
+                            *weights = reward_weights(*weights, grammar, sentence);
+                        }
+                        break;
+                    }
+                }
+            },
+            &mut Hypothesis::RewardOnlyRelevantVL(ref mut weights) => {
+                loop {
+                    let ref grammar = random_weighted_grammar(&weights);
+                    if let Ok(parses) = sentence_parses(domain, grammar, sentence) {
+                        if parses {
+                        }
+                        break;
+                    }
+                }
+            },
+            _ => panic!("not implemented")
+        }
+    }
 }
 
 struct IllegalGrammar ( Grammar );
@@ -133,38 +164,6 @@ pub fn reward_relevant_weights(mut weights: ParamWeights, grammar: &Grammar, sen
     weights
 }
 
-fn consume_sentence(hypothesis: Hypothesis, domain: &Domain, sentence: &Sentence) -> Hypothesis {
-    match hypothesis {
-        Hypothesis::RewardOnlyVL(mut weights) => {
-            loop {
-                let ref grammar = random_weighted_grammar(&weights);
-                // only returns ok if grammar exists in colag
-                if let Ok(parses) = sentence_parses(domain, grammar, sentence) {
-                    if parses {
-                        weights = reward_weights(weights, grammar, sentence);
-                    }
-                    break;
-                }
-            }
-            Hypothesis::RewardOnlyVL(weights)
-        },
-        Hypothesis::RewardOnlyRelevantVL(weights) => {
-            loop {
-                let ref grammar = random_weighted_grammar(&weights);
-                // only returns ok if grammar exists in colag
-                if let Ok(parses) = sentence_parses(domain, grammar, sentence) {
-                    if parses {
-                        reward_relevant_weights(weights, grammar, sentence, ());
-                    }
-                    break;
-                }
-            }
-            Hypothesis::RewardOnlyRelevantVL(weights)
-        },
-        _ => panic!("not implemented")
-    }
-}
-
 /// Returns paramter # `param_num` from `grammar`.
 fn get_param(grammar: &Grammar, param_num: usize) -> Grammar {
     (grammar >> (NUM_PARAMS - param_num - 1)) & 1
@@ -187,10 +186,12 @@ struct Report {
     hypothesis: Hypothesis,
     target: Grammar,
     converged: bool,
-    consumed: u32
+    consumed: u32,
+    runtime: Duration
 }
 
 fn learn_language(colag: &Domain, target: &Grammar, mut hypothesis: Hypothesis) -> Report {
+    let start = SystemTime::now();
     let mut rng = rand::thread_rng();
     let sentences: Vec<&u32> = colag.language
         .get(&target)
@@ -200,18 +201,30 @@ fn learn_language(colag: &Domain, target: &Grammar, mut hypothesis: Hypothesis) 
     let mut consumed = NUM_SENTENCES;
     for i in 1..NUM_SENTENCES {
         let sentence = rng.choose(&sentences).unwrap();
-        hypothesis = consume_sentence(hypothesis, colag, &sentence);
+        hypothesis.update(colag, &sentence);
         converged = hypothesis.converged();
         if converged {
             consumed = i;
             break;
         }
     }
+    let time = SystemTime::now().duration_since(start).unwrap();
     Report {
         hypothesis: hypothesis,
         target: *target,
         consumed: consumed,
-        converged: converged
+        converged: converged,
+        runtime: time
+    }
+}
+
+trait AsMs {
+    fn to_ms(&self) -> u64;
+}
+
+impl AsMs for Duration {
+    fn to_ms(&self) -> u64 {
+        self.as_secs() * 1000 + self.subsec_nanos() as u64 / 1_000_000
     }
 }
 
@@ -220,13 +233,14 @@ fn main() {
     let languages = vec![611, 584, 2253, 3856];
     let mut handles = Vec::new();
 
+    let start = SystemTime::now();
     for target in languages {
         let colag = colag.clone();
         handles.push(thread::spawn(move || {
             for _ in 0..100 {
                 let mut hypothesis = Hypothesis::new_reward_only();
                 let report = learn_language(&colag, &target, hypothesis);
-                println!("{} {} {} {}", report.converged, report.consumed, report.target, report.hypothesis)
+                println!("{} {} {} {} {:?}", report.converged, report.consumed, report.target, report.hypothesis, report.runtime.to_ms())
             }
         }))
     }
@@ -234,6 +248,7 @@ fn main() {
     for handle in handles {
         handle.join().unwrap();
     }
+    println!("total runtime: {:?}", SystemTime::now().duration_since(start).unwrap());
 }
 
 enum Parameter {
